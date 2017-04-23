@@ -153,6 +153,9 @@ struct Options {
   // Default: NULL
   const FilterPolicy* filter_policy;
 
+  // The max size for each level. L+1 = L * growth_factor
+  int growth_factor;
+
   // Create an Options object with default values for all fields.
   Options();
 };

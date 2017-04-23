@@ -18,6 +18,20 @@
 #include "util/random.h"
 #include "util/testutil.h"
 
+#include "leveldb/db.h"
+#include "leveldb/status.h"
+#include "leveldb/write_batch.h"
+#include <ctime>
+#include <cstdio>
+#include <fstream>
+#include <sys/types.h>
+#include <unistd.h>
+#include <iostream>
+#include <sstream>
+#include <string>
+#include <sys/time.h>
+
+using namespace std;
 // Comma-separated list of operations to run in the specified order
 //   Actual benchmarks:
 //      fillseq       -- write N values in sequential key order in async mode
@@ -47,18 +61,11 @@ static const char* FLAGS_benchmarks =
     "fillrandom,"
     "overwrite,"
     "readrandom,"
-    "readrandom,"  // Extra run to allow previous compactions to quiesce
     "readseq,"
     "readreverse,"
-    "compact,"
     "readrandom,"
-    "readseq,"
-    "readreverse,"
-    "fill100K,"
-    "crc32c,"
-    "snappycomp,"
-    "snappyuncomp,"
-    "acquireload,"
+	"deleteseq,"
+	"readhot"
     ;
 
 // Number of key/values to place in database
@@ -71,7 +78,7 @@ static int FLAGS_reads = -1;
 static int FLAGS_threads = 1;
 
 // Size of each value
-static int FLAGS_value_size = 100;
+static int FLAGS_value_size = 200;
 
 // Arrange to generate values that shrink to this fraction of
 // their original size after compression
@@ -113,6 +120,12 @@ static bool FLAGS_reuse_logs = false;
 
 // Use the db with the following name.
 static const char* FLAGS_db = NULL;
+
+// Print simple version of report
+static int FLAGS_brief = 0;
+
+// Growth facotr
+static int FLAGS_growth_factor = 10;
 
 namespace leveldb {
 
@@ -173,6 +186,79 @@ static void AppendWithSpace(std::string* str, Slice msg) {
   str->append(msg.data(), msg.size());
 }
 
+class IOProfile {
+
+public:
+  unsigned long long syscr;
+  unsigned long long syscw;
+  unsigned long long rbytes;
+  unsigned long long wbytes;
+  unsigned long long rchar;
+  unsigned long long wchar;
+
+  void Record() {
+
+    char iopath[100];
+    snprintf(iopath, sizeof(iopath), "/proc/%d/io", getpid());
+    ifstream ifs;
+    ifs.open(iopath, ifstream::in);
+    string line;
+    syscr = 0;
+    syscw = 0;
+    rchar = 0;
+    wchar = 0;
+    rbytes = 0;
+    wbytes = 0;
+    string head;
+    istringstream iss;
+
+    getline(ifs, line);
+    iss.str(line);
+    iss >> head >> rchar;
+
+    getline(ifs, line);
+    iss.clear();
+    iss.str(line);
+    iss >> head >> wchar;
+
+    getline(ifs, line);
+    iss.clear();
+    iss.str(line);
+    iss >> head >> syscr;
+
+    getline(ifs, line);
+    iss.clear();
+    iss.str(line);
+    iss >> head >> syscw;
+
+    getline(ifs, line);
+    iss.clear();
+    iss.str(line);
+    iss >> head >> rbytes;
+
+    getline(ifs, line);
+    iss.clear();
+    iss.str(line);
+    iss >> head >> wbytes;
+    ifs.close();
+
+    // cout << endl << iopath << endl;
+    // cout << head1 << syscr << endl;
+    // cout << head2 << syscw << endl << endl;
+  }
+
+  static IOProfile Diff(IOProfile& preProfile, IOProfile& postProfile) {
+    IOProfile diffProfile;
+    diffProfile.rchar = postProfile.rchar - preProfile.rchar;
+    diffProfile.wchar = postProfile.wchar - preProfile.wchar;
+    diffProfile.syscr = postProfile.syscr - preProfile.syscr;
+    diffProfile.syscw = postProfile.syscw - preProfile.syscw;
+    diffProfile.rbytes = postProfile.rbytes - preProfile.rbytes;
+    diffProfile.wbytes = postProfile.wbytes - preProfile.wbytes;
+    return diffProfile;
+  }
+};
+
 class Stats {
  private:
   double start_;
@@ -184,6 +270,8 @@ class Stats {
   double last_op_finish_;
   Histogram hist_;
   std::string message_;
+  IOProfile preProfile;
+  IOProfile postProfile;
 
  public:
   Stats() { Start(); }
@@ -198,6 +286,7 @@ class Stats {
     start_ = g_env->NowMicros();
     finish_ = start_;
     message_.clear();
+    preProfile.Record();
   }
 
   void Merge(const Stats& other) {
@@ -215,6 +304,7 @@ class Stats {
   void Stop() {
     finish_ = g_env->NowMicros();
     seconds_ = (finish_ - start_) * 1e-6;
+    postProfile.Record();
   }
 
   void AddMessage(Slice msg) {
@@ -234,17 +324,17 @@ class Stats {
     }
 
     done_++;
-    if (done_ >= next_report_) {
-      if      (next_report_ < 1000)   next_report_ += 100;
-      else if (next_report_ < 5000)   next_report_ += 500;
-      else if (next_report_ < 10000)  next_report_ += 1000;
-      else if (next_report_ < 50000)  next_report_ += 5000;
-      else if (next_report_ < 100000) next_report_ += 10000;
-      else if (next_report_ < 500000) next_report_ += 50000;
-      else                            next_report_ += 100000;
-      fprintf(stderr, "... finished %d ops%30s\r", done_, "");
-      fflush(stderr);
-    }
+//    if (done_ >= next_report_) {
+//      if      (next_report_ < 1000)   next_report_ += 100;
+//      else if (next_report_ < 5000)   next_report_ += 500;
+//      else if (next_report_ < 10000)  next_report_ += 1000;
+//      else if (next_report_ < 50000)  next_report_ += 5000;
+//      else if (next_report_ < 100000) next_report_ += 10000;
+//      else if (next_report_ < 500000) next_report_ += 50000;
+//      else                            next_report_ += 100000;
+//      fprintf(stderr, "... finished %d ops%30s\r", done_, "");
+//      fflush(stderr);
+//  }
   }
 
   void AddBytes(int64_t n) {
@@ -255,6 +345,8 @@ class Stats {
     // Pretend at least one op was done in case we are running a benchmark
     // that does not call FinishedSingleOp().
     if (done_ < 1) done_ = 1;
+
+    IOProfile diffProfile = IOProfile::Diff(preProfile, postProfile);
 
     std::string extra;
     if (bytes_ > 0) {
@@ -268,11 +360,18 @@ class Stats {
     }
     AppendWithSpace(&extra, message_);
 
-    fprintf(stdout, "%-12s : %11.3f micros/op;%s%s\n",
-            name.ToString().c_str(),
-            seconds_ * 1e6 / done_,
-            (extra.empty() ? "" : " "),
-            extra.c_str());
+	if (!FLAGS_brief) {
+			fprintf(stdout, "%-12s : %11.3f micros/op; %11f seconds\n",
+							name.ToString().c_str(),
+							seconds_ * 1e6 / done_,
+							seconds_
+				   );
+	} else {
+    // wall clock time, i/o cost, write amplification
+		fprintf(stdout, "%.6f,%.6f,%.6f,%1.6f", seconds_,seconds_ * 1e6 / done_,
+                                      1e6 * seconds_ / (diffProfile.syscw+diffProfile.syscr),
+                                      (double)diffProfile.wbytes / (bytes_ > 0 ? bytes_ : diffProfile.wchar));
+	}
     if (FLAGS_histogram) {
       fprintf(stdout, "Microseconds per op:\n%s\n", hist_.ToString().c_str());
     }
@@ -325,6 +424,15 @@ class Benchmark {
   WriteOptions write_options_;
   int reads_;
   int heap_counter_;
+
+  void PrintSize() {
+
+	
+    const int kKeySize = 16;
+    fprintf(stderr, "RawSize:    %.1f MB (estimated)\n",
+            ((static_cast<int64_t>(kKeySize + FLAGS_value_size) * num_)
+             / 1048576.0));
+		    }
 
   void PrintHeader() {
     const int kKeySize = 16;
@@ -431,7 +539,9 @@ class Benchmark {
   }
 
   void Run() {
+	if (!FLAGS_brief)
     PrintHeader();
+    PrintSize();
     Open();
 
     const char* benchmarks = FLAGS_benchmarks;
@@ -718,11 +828,13 @@ class Benchmark {
     options.max_open_files = FLAGS_open_files;
     options.filter_policy = filter_policy_;
     options.reuse_logs = FLAGS_reuse_logs;
+    options.growth_factor = FLAGS_growth_factor;
     Status s = DB::Open(options, FLAGS_db, &db_);
     if (!s.ok()) {
       fprintf(stderr, "open error: %s\n", s.ToString().c_str());
       exit(1);
     }
+    fflush(stdout);
   }
 
   void OpenBench(ThreadState* thread) {
@@ -997,6 +1109,10 @@ int main(int argc, char** argv) {
       FLAGS_bloom_bits = n;
     } else if (sscanf(argv[i], "--open_files=%d%c", &n, &junk) == 1) {
       FLAGS_open_files = n;
+    } else if (sscanf(argv[i], "--brief=%d%c", &n, &junk) == 1) {
+      FLAGS_brief = n;
+    } else if (sscanf(argv[i], "--growth_factor=%d%c", &n, &junk) == 1) {
+      FLAGS_growth_factor = n;
     } else if (strncmp(argv[i], "--db=", 5) == 0) {
       FLAGS_db = argv[i] + 5;
     } else {
@@ -1004,6 +1120,8 @@ int main(int argc, char** argv) {
       exit(1);
     }
   }
+
+  fprintf(stdout,"%d,",FLAGS_growth_factor);
 
   leveldb::g_env = leveldb::Env::Default();
 

@@ -24,6 +24,7 @@ Options::Options()
       max_file_size(2<<20),
       compression(kSnappyCompression),
       reuse_logs(false),
+      growth_factor(10),
       filter_policy(NULL) {
 }
 
