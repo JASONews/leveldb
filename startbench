@@ -1,0 +1,9 @@
+#!/bin/bash
+
+if [[ -a nohup.out ]]
+then
+	mv nohup.out nohup.out"_`date`"
+fi
+
+sudo nohup ./test.sh &
+
